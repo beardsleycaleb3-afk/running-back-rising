@@ -1,11 +1,14 @@
 // ============================================================================
 // SERVICE WORKER - Running Back Rising
 // Handles caching, offline support, and background sync
+// v1.2 - Updated with audio & power-ups modules
 // ============================================================================
 
-const CACHE_NAME = 'running-back-rising-v1.1';
-const ASSETS_CACHE = 'running-back-rising-assets-v1.1';
-const RUNTIME_CACHE = 'running-back-rising-runtime-v1.1';
+const CACHE_VERSION = 'v1.2';
+const CACHE_NAME = `running-back-rising-${CACHE_VERSION}`;
+const ASSETS_CACHE = `running-back-rising-assets-${CACHE_VERSION}`;
+const RUNTIME_CACHE = `running-back-rising-runtime-${CACHE_VERSION}`;
+const IMAGE_CACHE = `running-back-rising-images-${CACHE_VERSION}`;
 
 const urlsToCache = [
   '/',
@@ -13,7 +16,11 @@ const urlsToCache = [
   '/js/game.js',
   '/js/modules.js',
   '/js/config.js',
+  '/js/audio.js',
+  '/js/powerups.js',
+  '/js/visual-polish.js',
   '/manifest.json',
+  '/sw.js',
   '/assets/icon_192.jpg'
 ];
 
@@ -22,17 +29,24 @@ const urlsToCache = [
 // ============================================================================
 
 self.addEventListener('install', (event) => {
-  console.log('[Service Worker] Installing...');
+  console.log(`[Service Worker] Installing ${CACHE_VERSION}...`);
   
   event.waitUntil(
-    caches.open(CACHE_NAME)
-      .then((cache) => {
+    Promise.all([
+      // Cache core files
+      caches.open(CACHE_NAME).then((cache) => {
         console.log('[Service Worker] Caching essential files');
-        return cache.addAll(urlsToCache);
-      })
-      .catch((error) => {
-        console.error('[Service Worker] Cache install failed:', error);
-      })
+        return cache.addAll(urlsToCache).catch((error) => {
+          console.warn('[Service Worker] Some files failed to cache (may be offline):', error);
+          // Continue even if some files fail - fallback to network
+          return Promise.resolve();
+        });
+      }),
+      // Pre-open other caches
+      caches.open(ASSETS_CACHE),
+      caches.open(RUNTIME_CACHE),
+      caches.open(IMAGE_CACHE)
+    ])
   );
   
   // Force immediate activation
@@ -50,10 +64,12 @@ self.addEventListener('activate', (event) => {
     caches.keys().then((cacheNames) => {
       return Promise.all(
         cacheNames.map((cacheName) => {
-          // Delete old versions
+          // Keep only current version caches
           if (cacheName !== CACHE_NAME && 
               cacheName !== ASSETS_CACHE && 
-              cacheName !== RUNTIME_CACHE) {
+              cacheName !== RUNTIME_CACHE &&
+              cacheName !== IMAGE_CACHE &&
+              cacheName.includes('running-back-rising')) {
             console.log('[Service Worker] Deleting old cache:', cacheName);
             return caches.delete(cacheName);
           }
@@ -64,10 +80,19 @@ self.addEventListener('activate', (event) => {
   
   // Take control immediately
   self.clients.claim();
+  
+  // Notify clients that SW is ready
+  self.clients.matchAll().then((clients) => {
+    clients.forEach((client) => {
+      client.postMessage({ type: 'SW_READY' });
+    });
+  });
+  
+  console.log('[Service Worker] Ready for offline use');
 });
 
 // ============================================================================
-// FETCH - Network-first with fallback to cache
+// FETCH - Intelligent caching strategy
 // ============================================================================
 
 self.addEventListener('fetch', (event) => {
@@ -84,43 +109,92 @@ self.addEventListener('fetch', (event) => {
     return;
   }
   
-  // Handle different types of requests
-  if (url.pathname.includes('/js/') || url.pathname.includes('/manifest.json')) {
-    // Cache-first for JavaScript and manifest
-    event.respondWith(
-      caches.match(request)
-        .then((response) => {
-          return response || fetch(request)
-            .then((response) => {
-              // Don't cache non-successful responses
-              if (!response || response.status !== 200 || response.type === 'error') {
-                return response;
-              }
-              
-              // Clone and cache the response
-              const responseToCache = response.clone();
-              caches.open(CACHE_NAME).then((cache) => {
-                cache.put(request, responseToCache);
-              });
-              
+  // Skip chrome extensions and other protocols
+  if (!url.protocol.startsWith('http')) {
+    return;
+  }
+  
+  // Define caching strategies based on content type
+  const path = url.pathname;
+  
+  // JavaScript files - Cache-first (fast but update every 60 seconds)
+  if (path.endsWith('.js')) {
+    return event.respondWith(
+      caches.match(request).then((response) => {
+        return response || fetch(request)
+          .then((response) => {
+            if (!response || response.status !== 200) {
               return response;
-            })
-            .catch(() => {
-              // Return cached version if offline
-              return caches.match(request);
+            }
+            
+            const responseToCache = response.clone();
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(request, responseToCache);
             });
-        })
+            
+            return response;
+          })
+          .catch(() => caches.match(request))
+      })
     );
-  } else {
-    // Network-first for HTML and other assets
-    event.respondWith(
+  }
+  
+  // Images - Cache-first with long expiry
+  if (path.match(/\.(jpg|jpeg|png|gif|webp|svg)$/)) {
+    return event.respondWith(
+      caches.match(request).then((response) => {
+        return response || fetch(request)
+          .then((response) => {
+            if (!response || response.status !== 200) {
+              return response;
+            }
+            
+            const responseToCache = response.clone();
+            caches.open(IMAGE_CACHE).then((cache) => {
+              cache.put(request, responseToCache);
+            });
+            
+            return response;
+          })
+          .catch(() => {
+            // Return placeholder or cached version
+            return caches.match(request);
+          })
+      })
+    );
+  }
+  
+  // Manifest and other assets - Cache-first
+  if (path.includes('.json') || path.includes('.xml')) {
+    return event.respondWith(
+      caches.match(request).then((response) => {
+        return response || fetch(request)
+          .then((response) => {
+            if (!response || response.status !== 200) {
+              return response;
+            }
+            
+            const responseToCache = response.clone();
+            caches.open(CACHE_NAME).then((cache) => {
+              cache.put(request, responseToCache);
+            });
+            
+            return response;
+          })
+          .catch(() => caches.match(request))
+      })
+    );
+  }
+  
+  // HTML files - Network-first (always try to get latest)
+  if (path.endsWith('/') || path.endsWith('.html')) {
+    return event.respondWith(
       fetch(request)
         .then((response) => {
-          if (!response || response.status !== 200 || response.type === 'error') {
+          if (!response || response.status !== 200) {
             return response;
           }
           
-          // Cache successful responses
           const responseToCache = response.clone();
           caches.open(RUNTIME_CACHE).then((cache) => {
             cache.put(request, responseToCache);
@@ -129,21 +203,30 @@ self.addEventListener('fetch', (event) => {
           return response;
         })
         .catch(() => {
-          // Fallback to cache if network fails
-          return caches.match(request)
-            .then((response) => {
-              if (response) {
-                return response;
-              }
-              
-              // Return offline page if available
-              if (request.destination === 'document') {
-                return caches.match('/index.html');
-              }
-            });
+          return caches.match(request).then((response) => {
+            return response || caches.match('/index.html');
+          });
         })
     );
   }
+  
+  // Default - Network-first with cache fallback
+  event.respondWith(
+    fetch(request)
+      .then((response) => {
+        if (!response || response.status !== 200) {
+          return response;
+        }
+        
+        const responseToCache = response.clone();
+        caches.open(RUNTIME_CACHE).then((cache) => {
+          cache.put(request, responseToCache);
+        });
+        
+        return response;
+      })
+      .catch(() => caches.match(request))
+  );
 });
 
 // ============================================================================
@@ -152,23 +235,31 @@ self.addEventListener('fetch', (event) => {
 
 self.addEventListener('message', (event) => {
   const { type, payload } = event.data;
+  console.log('[Service Worker] Message received:', type);
   
   switch (type) {
     case 'CLEAR_CACHE':
-      console.log('[Service Worker] Clearing cache');
+      console.log('[Service Worker] Clearing all caches');
       caches.keys().then((cacheNames) => {
-        Promise.all(
-          cacheNames.map((cacheName) => caches.delete(cacheName))
+        return Promise.all(
+          cacheNames.map((cacheName) => {
+            if (cacheName.includes('running-back-rising')) {
+              return caches.delete(cacheName);
+            }
+          })
         );
+      }).then(() => {
+        if (event.ports && event.ports[0]) {
+          event.ports[0].postMessage({ success: true, cleared: true });
+        }
       });
-      event.ports[0].postMessage({ success: true });
       break;
       
     case 'GET_CACHE_SIZE':
       console.log('[Service Worker] Getting cache size');
       let totalSize = 0;
       caches.keys().then((cacheNames) => {
-        Promise.all(
+        return Promise.all(
           cacheNames.map((cacheName) => {
             return caches.open(cacheName).then((cache) => {
               return cache.keys().then((requests) => {
@@ -188,18 +279,27 @@ self.addEventListener('message', (event) => {
               });
             });
           })
-        ).then(() => {
+        );
+      }).then(() => {
+        if (event.ports && event.ports[0]) {
           event.ports[0].postMessage({ 
             success: true, 
             size: totalSize,
             sizeInMB: (totalSize / 1024 / 1024).toFixed(2)
           });
-        });
+        }
       });
       break;
       
     case 'SKIP_WAITING':
+      console.log('[Service Worker] Skipping wait period');
       self.skipWaiting();
+      break;
+      
+    case 'GET_VERSION':
+      if (event.ports && event.ports[0]) {
+        event.ports[0].postMessage({ version: CACHE_VERSION });
+      }
       break;
       
     default:
@@ -212,31 +312,39 @@ self.addEventListener('message', (event) => {
 // ============================================================================
 
 self.addEventListener('push', (event) => {
+  console.log('[Service Worker] Push notification received');
+  
   if (!event.data) {
+    console.warn('[Service Worker] Push event without data');
     return;
   }
   
-  const data = event.data.json();
-  const options = {
-    body: data.body || 'Running Back Rising notification',
-    icon: '/assets/icon_192.jpg',
-    badge: '/assets/icon_192.jpg',
-    tag: 'running-back-rising',
-    requireInteraction: false,
-    actions: [
-      {
-        action: 'open',
-        title: 'Open Game'
-      }
-    ]
-  };
-  
-  event.waitUntil(
-    self.registration.showNotification(data.title || 'Running Back Rising', options)
-  );
+  try {
+    const data = event.data.json();
+    const options = {
+      body: data.body || 'Running Back Rising notification',
+      icon: '/assets/icon_192.jpg',
+      badge: '/assets/icon_192.jpg',
+      tag: 'running-back-rising',
+      requireInteraction: false,
+      actions: [
+        {
+          action: 'open',
+          title: 'Open Game'
+        }
+      ]
+    };
+    
+    event.waitUntil(
+      self.registration.showNotification(data.title || 'Running Back Rising', options)
+    );
+  } catch (error) {
+    console.error('[Service Worker] Push notification error:', error);
+  }
 });
 
 self.addEventListener('notificationclick', (event) => {
+  console.log('[Service Worker] Notification clicked:', event.action);
   event.notification.close();
   
   if (event.action === 'open' || !event.action) {
@@ -264,6 +372,8 @@ self.addEventListener('notificationclick', (event) => {
 // ============================================================================
 
 self.addEventListener('sync', (event) => {
+  console.log('[Service Worker] Background sync event:', event.tag);
+  
   if (event.tag === 'sync-scores') {
     event.waitUntil(
       // Sync leaderboard scores with server when online
@@ -278,15 +388,20 @@ self.addEventListener('sync', (event) => {
       })
       .then((response) => {
         if (response.ok) {
-          console.log('[Service Worker] Score sync successful');
+          console.log('[Service Worker] ✅ Score sync successful');
         }
       })
       .catch((error) => {
-        console.error('[Service Worker] Score sync failed:', error);
+        console.error('[Service Worker] ❌ Score sync failed:', error);
         throw error; // Retry later
       })
     );
   }
 });
 
-console.log('[Service Worker] Loaded and ready');
+// ============================================================================
+// LOGGING
+// ============================================================================
+
+console.log(`[Service Worker] ${CACHE_VERSION} loaded and ready for offline use`);
+console.log('[Service Worker] Caching strategy: JS=cache-first, HTML=network-first, Images=cache-first');
